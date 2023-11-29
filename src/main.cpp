@@ -9,8 +9,6 @@
 
 WiFiClientSecure client;
 
-//TODO: code refactoring of the project
-
 // CONFIG
 const char* ssid = "wifiname";                                                                                // SSID WiFi network
 const char* pass = "test1234";                                                                                // Password    WiFi network
@@ -22,6 +20,10 @@ int64_t userid = 0000000;
 // Timezone definition to get properly time from NTP server
 #define MYTZ "CET-1CEST,M3.5.0,M10.5.0/3" //Europe/Amsterdam
 #define PIR_PIN GPIO_NUM_12
+#define ONBOARD_LED_PIN GPIO_NUM_33
+// The onboard LED works with inverted logic
+#define LED_ON digitalWrite(ONBOARD_LED_PIN, LOW);
+#define LED_OFF digitalWrite(ONBOARD_LED_PIN, HIGH);
 
 bool enable_detection = false;
 bool photo_mode = false;
@@ -30,20 +32,16 @@ int reboot_time_interval = 10000; // time in milliseconds after which the esp32 
 // END CONFIG
 
 AsyncTelegram2 tgbot(client);
-String lastcommand;
+int lastmsgID;
 
 
 /* FUNCTION SIGNATURES */
 void sendMessage(String message);
 void RebootCamera(pixformat_t format);
-void RestartCamera(pixformat_t format);
 bool checkFile(String filename);
 /* -------- */
 
 void reboot() {
-    //Note: we must use a workaround to reboot ESP32 chip using ssl client (Telegram) OR camera
-    //SSL client doesn't work with camera enabled
-    //We use files as switches to remember the previous state
     //switch mode
     if (enable_detection) {
         SPIFFS.remove("/detect.txt");
@@ -54,8 +52,7 @@ void reboot() {
     }
     //Save the last command
     File file = SPIFFS.open("/lastcmd.txt", FILE_WRITE);
-    size_t res = file.print(lastcommand);
-    Serial.println("Wrote "+String(res) + " bytes, " + lastcommand);
+    size_t res = file.print(lastmsgID);
     file.close();
     Serial.println("Triggering reboot..");
     delay(500);
@@ -69,19 +66,22 @@ void setup() {
     Serial.begin(115200);
     Serial.println();
 
+    pinMode(ONBOARD_LED_PIN, OUTPUT);
+    delay(50);
+    LED_ON;
+
     WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);             // disable brownout detector
     pinMode(LAMP_PIN, OUTPUT);                                             // set the lamp pin as output
     ledcSetup(lampChannel, pwmfreq, pwmresolution);    // configure LED PWM channel
     setLamp(0);                                                                            // set default value
-    ledcAttachPin(LAMP_PIN, lampChannel);                        // attach the GPIO pin to the channel
+    //ledcAttachPin(LAMP_PIN, lampChannel);                        // attach the GPIO pin to the channel
 
     pinMode(PIR_PIN, INPUT);
-    delay(200);
 
     // Spiffs
     if (!SPIFFS.begin(true)) {
         Serial.println("An Error has occurred while mounting SPIFFS - restarting");
-        delay(1000);
+        delay(200);
         ESP.restart();                                // restart and try again
         delay(5000);
     } else {
@@ -91,9 +91,8 @@ void setup() {
 
     // load last command
     File file = SPIFFS.open("/lastcmd.txt", FILE_READ);
-    lastcommand = file.readString();
+    lastmsgID = file.readString().toInt();
     file.close();
-    Serial.println("Last command saved on disk "+lastcommand);
 
     // load detection mode
     enable_detection = SPIFFS.exists("/detect.txt") && (!SPIFFS.exists("/disable.txt"));
@@ -104,12 +103,15 @@ void setup() {
         //WiFi.disconnect(true);
         //WiFi.mode(WIFI_OFF);
         photo_mode = SPIFFS.exists("/photo_request.txt");
+        Serial.println("take photo: ");
+        Serial.print(photo_mode);
+        Serial.println("");
         // Init the camera module (according the camera_config_t defined)
         bool tRes = setupCameraHardware(PIXFORMAT_JPEG);
         if (!tRes) {      // reboot camera
             delay(500);
             Serial.println("Problem starting camera - rebooting it");
-            RestartCamera(PIXFORMAT_JPEG); // RestartCamera reboot system if it fails
+            RebootCamera(PIXFORMAT_JPEG); // reboot system if it fails
         } else {
             Serial.println("Camera initialised ok");
             if (photo_mode)
@@ -118,16 +120,17 @@ void setup() {
     } else {
         // Detection not enabled - listen for commands on telegram
         photo_mode = false;
-        esp_camera_deinit();
-        digitalWrite(PWDN_GPIO_NUM, HIGH);
-        delay(200);
 
         // Start WiFi connection
+        Serial.println("Connecting");
         WiFi.begin(ssid, pass);
-        while (WiFi.status() != WL_CONNECTED) {
-            delay(500);
+        int attempts = 12;
+        while ((WiFi.status() != WL_CONNECTED) && (attempts > 0)) {
+            delay(1000);
             Serial.print(".");
+            attempts--;
         }
+        if (attempts == 0) ESP.restart();
         Serial.println("");
         Serial.println("WiFi connected");
         Serial.println(WiFi.localIP());
@@ -144,9 +147,16 @@ void setup() {
 
         // Check if all things are ok
         Serial.print("\nTest Telegram connection... ");
-        tgbot.begin() ? Serial.println("OK") : Serial.println("NOK");
+        bool tg_res = tgbot.begin();
+        if (tg_res) {
+            Serial.println("OK");
+        } else {
+            Serial.println("NOK");
+            ESP.restart();
+        }
     }
-
+    LED_OFF;
+    delay(50);
 }
 
 // ---------- END SETUP ---------------
@@ -163,6 +173,7 @@ void doPhotoRequest() {
     File file = SPIFFS.open("/photo_request.txt", FILE_WRITE);
     file.write(0);
     file.close();
+    Serial.println("wrote photo request");
     delay(500);
     reboot();
     delay(5000);
@@ -174,9 +185,11 @@ void handleCommands() {
     // if there is an incoming message...
     if (tgbot.getNewMessage(msg)) {
         MessageType msgType = msg.messageType;
-        Serial.println("Received "+ String(msg.messageID) + " - " + msg.text + ", last command was " +lastcommand);
-        if ((msgType == MessageText) && (!msg.text.equals(lastcommand))) {
-            lastcommand = msg.text;
+        Serial.println("Received "+ String(msg.messageID) + " - " + msg.text + ", last command id was " +String(lastmsgID));
+        // we must check if the last command is different from the current command
+        // unfortunately, the library fetches always the last command even if it was already read
+        if ((msgType == MessageText) && (msg.messageID != lastmsgID)) {
+            lastmsgID = msg.messageID;
             Serial.println("New message: "+msg.text);
             // Received a text message
             if (msg.text.equalsIgnoreCase("/getphoto")) {
@@ -186,20 +199,16 @@ void handleCommands() {
                 sendMessage("ESP32 intrusion detection started");
                 SPIFFS.remove("/disable.txt");
                 reboot();
-                delay(5000);
-            } else if (msg.text.equalsIgnoreCase("/stop")) {
+            } else if ((msg.text.equalsIgnoreCase("/stop") || (msg.text.equalsIgnoreCase("/poweroff")))) {
                 sendMessage("ESP32 intrusion detection stopped");
                 File file = SPIFFS.open("/disable.txt", FILE_WRITE);
                 file.write(0);
                 file.close();
                 delay(500);
-                delay(500);
                 reboot();
-                delay(5000);
             } else if ((msg.text.equalsIgnoreCase("/reboot")) && (!enable_detection)) {
                 sendMessage("Rebooting ESP32");
                 reboot();
-                delay(5000);
             } else if (msg.text.equalsIgnoreCase("/status")) {
                 (SPIFFS.exists("/disable.txt")) ? sendMessage("intrusion detection stopped") : sendMessage("intrusion detection started");
             } else {
@@ -214,29 +223,6 @@ void handleCommands() {
 
 // ---------- CAMERA FUNCTIONS --------
 
-// ----------------------------------------------------------------
-//              -restart the camera in different mode
-// ----------------------------------------------------------------
-// switches camera mode - format = PIXFORMAT_GRAYSCALE or PIXFORMAT_JPEG
-void RestartCamera(pixformat_t format) {
-    esp_camera_deinit();
-    bool ok = setupCameraHardware(format);
-    if (ok) {
-        Serial.println("Camera mode switched ok");
-    } else {
-        // failed so try again
-        esp_camera_deinit();
-        delay(50);
-        ok = setupCameraHardware(format); //esp_camera_init(&config);
-        if (ok) {
-            Serial.println("Camera mode switched ok - 2nd attempt");
-        } else {
-            Serial.println("Camera failed to restart so rebooting camera");        // store in bootlog
-            RebootCamera(format);
-        }
-    }
-}
-
 // reboot camera (used if camera is failing to respond)
 //      restart camera in motion mode, capture a test frame to check it is now responding ok
 //      format = PIXFORMAT_GRAYSCALE or PIXFORMAT_JPEG
@@ -247,16 +233,17 @@ void RebootCamera(pixformat_t format) {
     delay(200);
     digitalWrite(PWDN_GPIO_NUM, LOW);
     delay(400);
-    RestartCamera(PIXFORMAT_JPEG);    // restart camera in motion mode
+    esp_camera_deinit();
+    delay(50);
+    bool ok = setupCameraHardware(format);
     delay(50);
     // try capturing a frame, if still problem reboot esp32
-    if (!capture_image()) {
+    if ((!ok) || (!capture_image())) {
         Serial.println("Camera failed to reboot so rebooting esp32");    // store in bootlog
         delay(500);
-        reboot();
+        ESP.restart();
         delay(5000);      // restart will fail without this delay
     }
-    if (format == PIXFORMAT_JPEG) RestartCamera(PIXFORMAT_JPEG);                  // if jpg mode required restart camera again
 }
 
 
@@ -268,9 +255,12 @@ bool saveJpgFrame(bool useflash) {
     // Take Picture with Camera;
     Serial.println("Camera capture requested");
     // Take picture with Camera and send to Telegram
-    if (useflash) setLamp(100);
+    if (useflash) {
+        digitalWrite(LAMP_PIN, HIGH);
+    }
     camera_fb_t* fb = esp_camera_fb_get();
-    setLamp(0);
+    delay(20);
+    digitalWrite(LAMP_PIN, LOW);
 
     // grab frame
     if (!fb) {
@@ -331,7 +321,8 @@ bool checkFile(String filename) {
 void loop() {
     if (enable_detection) {
         if (photo_mode) {
-            saveJpgFrame(true);
+            Serial.println("taking photo");
+            saveJpgFrame(false);
             //now reboot and switch mode to send it to telegram
             reboot();
         } else {
@@ -341,13 +332,13 @@ void loop() {
             if (motion_detected) {
                 if (tCounter >= tCounterTrigger) {                                                // only trigger if movement detected in more than one consequitive frames
                     tCounter = 0;
-                    saveJpgFrame(true);
+                    saveJpgFrame(false);
                     reboot();
                 } else {
                     Serial.println("Not enough consecutive detections");
                 }
             }
-            reboot_time_interval = 15000;
+            reboot_time_interval = 10000;
         }
     } else { // Telegram mode
         if (checkFile("/photo.jpg")) {
