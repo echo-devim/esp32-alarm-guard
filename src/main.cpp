@@ -10,8 +10,8 @@
 WiFiClientSecure client;
 
 // CONFIG
-const char* ssid = "wifiname";                                                                                // SSID WiFi network
-const char* pass = "test1234";                                                                                // Password    WiFi network
+const char* ssid = "wifiname";
+const char* pass = "test1234";
 const char* token = "xxxxxx:xxxxxx";    // Telegram token
 // Check the userid with the help of bot @JsonDumpBot or @getidsbot (work also with groups)
 // https://t.me/JsonDumpBot    or    https://t.me/getidsbot
@@ -26,7 +26,7 @@ int64_t userid = 0000000;
 #define LED_OFF digitalWrite(ONBOARD_LED_PIN, HIGH);
 
 bool enable_detection = false;
-bool photo_mode = false;
+int photo_mode = 0;
 int boot_time = millis();
 int reboot_time_interval = 10000; // time in milliseconds after which the esp32 is rebooted switching behaviour
 // END CONFIG
@@ -62,6 +62,25 @@ void reboot() {
     delay(500);
 }
 
+esp_sleep_wakeup_cause_t get_wakeup_reason(){
+  esp_sleep_wakeup_cause_t wakeup_reason;
+
+  wakeup_reason = esp_sleep_get_wakeup_cause();
+  Serial.printf("wakeup_reason = %d\n", wakeup_reason);
+
+  switch(wakeup_reason)
+  {
+    case 1  : Serial.println("Wakeup caused by external signal using RTC_IO"); break;
+    case 2  : Serial.println("Wakeup caused by external signal using RTC_CNTL"); break;
+    case 3  : Serial.println("Wakeup caused by timer"); break;
+    case 4  : Serial.println("Wakeup caused by touchpad"); break;
+    case 5  : Serial.println("Wakeup caused by ULP program"); break;
+    default : Serial.println("Wakeup was not caused by deep sleep"); break;
+  }
+
+  return wakeup_reason;
+}
+
 void setup() {
     Serial.begin(115200);
     Serial.println();
@@ -69,6 +88,8 @@ void setup() {
     pinMode(ONBOARD_LED_PIN, OUTPUT);
     delay(50);
     LED_ON;
+    delay(100);
+    LED_OFF;
 
     WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);             // disable brownout detector
     pinMode(LAMP_PIN, OUTPUT);                                             // set the lamp pin as output
@@ -100,12 +121,16 @@ void setup() {
 
     // if detection is enabled, check if on filesystem we have a photo request
     if (enable_detection) {
-        //WiFi.disconnect(true);
-        //WiFi.mode(WIFI_OFF);
-        photo_mode = SPIFFS.exists("/photo_request.txt");
-        Serial.println("take photo: ");
-        Serial.print(photo_mode);
-        Serial.println("");
+        //photo_mode = 0 no photo, 1 photo without flash, 2 photo with flash
+        if (SPIFFS.exists("/photo_request.txt")) {
+            File file = SPIFFS.open("/photo_request.txt", "r");
+            file.read((uint8_t*)&photo_mode, 1); // this is 0 (photo without flash) or 1 (photo with flash) 
+            file.close();
+            photo_mode++;
+        } else {
+            photo_mode = 0;
+        }
+
         // Init the camera module (according the camera_config_t defined)
         bool tRes = setupCameraHardware(PIXFORMAT_JPEG);
         if (!tRes) {      // reboot camera
@@ -114,12 +139,30 @@ void setup() {
             RebootCamera(PIXFORMAT_JPEG); // reboot system if it fails
         } else {
             Serial.println("Camera initialised ok");
-            if (photo_mode)
+            if (photo_mode) {
                 SPIFFS.remove("/photo_request.txt");
+            } else {
+                esp_sleep_wakeup_cause_t wakeup_reason = get_wakeup_reason();
+                if (wakeup_reason == 2) {
+                    // if wakeup is caused by PIR sensor, take a photo
+                } else if (wakeup_reason == 4) {
+                    // if wakeup is caused by timer, just switch mode
+                    if (!photo_mode) {
+                        reboot();
+                    }
+                } else {
+                    // if deep sleep was not called, go to sleep
+                    Serial.println("Going to sleep");
+                    int seconds = 20;
+                    esp_sleep_enable_timer_wakeup(seconds*1000000);
+                    esp_sleep_enable_ext0_wakeup(PIR_PIN, 1);
+                    delay(100);
+                    esp_deep_sleep_start();
+                } 
+            }
         }
     } else {
         // Detection not enabled - listen for commands on telegram
-        photo_mode = false;
 
         // Start WiFi connection
         Serial.println("Connecting");
@@ -155,8 +198,6 @@ void setup() {
             ESP.restart();
         }
     }
-    LED_OFF;
-    delay(50);
 }
 
 // ---------- END SETUP ---------------
@@ -169,14 +210,13 @@ void sendMessage(String message) {
     tgbot.sendTo(userid, message);
 }
 
-void doPhotoRequest() {
+void doPhotoRequest(bool flash) {
     File file = SPIFFS.open("/photo_request.txt", FILE_WRITE);
-    file.write(0);
+    file.write(flash);
     file.close();
     Serial.println("wrote photo request");
     delay(500);
     reboot();
-    delay(5000);
 }
 
 void handleCommands() {
@@ -194,7 +234,10 @@ void handleCommands() {
             // Received a text message
             if (msg.text.equalsIgnoreCase("/getphoto")) {
                 Serial.println("Sending Photo from CAM");
-                doPhotoRequest();
+                doPhotoRequest(false);
+            } else if (msg.text.equalsIgnoreCase("/getphotoflash")) {
+                Serial.println("Sending Photo from CAM with flash");
+                doPhotoRequest(true);
             } else if (msg.text.equalsIgnoreCase("/start")) {
                 sendMessage("ESP32 intrusion detection started");
                 SPIFFS.remove("/disable.txt");
@@ -294,9 +337,9 @@ bool saveJpgFrame(bool useflash) {
             if (!SPIFFS.format()) {
                 Serial.println("Error: Unable to format Spiffs");
                 return false;
-            }
+            }*/
             file = SPIFFS.open(FileName, FILE_WRITE);
-            if (!file.write(fb->buf, fb->len)) Serial.println("Error: Still unable to write image to Spiffs");*/
+            if (!file.write(fb->buf, fb->len)) Serial.println("Error: Still unable to write image to Spiffs");
         }
         file.close();
     }
@@ -319,27 +362,12 @@ bool checkFile(String filename) {
 
 // ---------- MAIN LOOP ---------------
 void loop() {
+    reboot_time_interval = 5000;
     if (enable_detection) {
-        if (photo_mode) {
-            Serial.println("taking photo");
-            saveJpgFrame(false);
-            //now reboot and switch mode to send it to telegram
-            reboot();
-        } else {
-            // camera motion detection
-            // Check if PIR sensor is detecting motion
-            bool motion_detected = digitalRead(PIR_PIN);
-            if (motion_detected) {
-                if (tCounter >= tCounterTrigger) {                                                // only trigger if movement detected in more than one consequitive frames
-                    tCounter = 0;
-                    saveJpgFrame(false);
-                    reboot();
-                } else {
-                    Serial.println("Not enough consecutive detections");
-                }
-            }
-            reboot_time_interval = 10000;
-        }
+        Serial.println("taking photo");
+        saveJpgFrame(photo_mode == 2);
+        //now reboot and switch mode to send it to telegram
+        reboot();
     } else { // Telegram mode
         if (checkFile("/photo.jpg")) {
             Serial.println("Found saved image, sending to telegram");
@@ -348,7 +376,6 @@ void loop() {
         } else {
             handleCommands();
         }
-        reboot_time_interval = 5000;
     }
 
     // Check if it is time to switch mode
