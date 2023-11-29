@@ -23,7 +23,8 @@
 #define LAMP_PIN 4
 
 // Image Settings
-#define FRAME_SIZE_PHOTO FRAMESIZE_SVGA       // Image sizes: 160x120 (QQVGA), 128x160 (QQVGA2), 176x144 (QCIF), 240x176 (HQVGA), 320x240 (QVGA), 400x296 (CIF), 640x480 (VGA, default), 800x600 (SVGA), 1024x768 (XGA), 1280x1024 (SXGA), 1600x1200 (UXGA)
+// Image sizes: 160x120 (QQVGA), 128x160 (QQVGA2), 176x144 (QCIF), 240x176 (HQVGA), 320x240 (QVGA), 400x296 (CIF), 640x480 (VGA, default), 800x600 (SVGA), 1024x768 (XGA), 1280x1024 (SXGA), 1600x1200 (UXGA)
+#define FRAME_SIZE_PHOTO FRAMESIZE_SVGA
 //   ---------------------------------------------------------------------------------------------------------------------
 
 
@@ -56,43 +57,6 @@ void setLamp(int newVal) {
         Serial.print("%, pwm = ");
         Serial.println(brightness);
     }
-}
-
-static esp_err_t init_camera(camera_config_t &camera_config) {
-     
-    // Best picture quality, but first frame requestes get lost sometimes (comment/uncomment to try)
-    if (psramFound()) {
-        Serial.println("PSRAM found");
-        camera_config.fb_count = 2;
-        camera_config.grab_mode = CAMERA_GRAB_LATEST;
-        camera_config.jpeg_quality = 5;
-    }
-    
-    //initialize the camera
-    Serial.println("Camera init... ");
-    esp_err_t err = esp_camera_init(&camera_config);
-
-    if (err != ESP_OK) {
-        delay(100);    // need a delay here or the next serial o/p gets missed
-        Serial.printf("\n\nCRITICAL FAILURE: Camera sensor failed to initialise.\n\n");
-        Serial.printf("A full (hard, power off/on) reboot will probably be needed to recover from this.\n");
-        return err;
-    } else {
-        Serial.println("succeeded");
-
-        // Get a reference to the sensor
-        sensor_t* s = esp_camera_sensor_get();
-
-        // Dump camera module, warn for unsupported modules.
-        switch (s->id.PID) {
-            case OV9650_PID: Serial.println("WARNING: OV9650 camera module is not properly supported, will fallback to OV2640 operation"); break;
-            case OV7725_PID: Serial.println("WARNING: OV7725 camera module is not properly supported, will fallback to OV2640 operation"); break;
-            case OV2640_PID: Serial.println("OV2640 camera module detected"); break;
-            case OV3660_PID: Serial.println("OV3660 camera module detected"); break;
-            default: Serial.println("WARNING: Camera module is unknown and not properly supported, will fallback to OV2640 operation");
-        }
-    }
-    return ESP_OK;
 }
 
 // ---------------------------------------------------------------
@@ -128,10 +92,39 @@ bool setupCameraHardware(pixformat_t format) {
     config.jpeg_quality = 10;            // 0-63 lower number means higher quality (can cause failed image capture if set too low at higher resolutions)
     config.fb_count = 1;                 // if more than one, i2s runs in continuous mode. Use only with JPEG
 
-    esp_err_t camerr = init_camera(config);  // initialise the camera
-    if (camerr != ESP_OK) Serial.printf("ERROR: Camera init failed with error 0x%x", camerr);
+   
+    // Best picture quality, but first frame requestes get lost sometimes (comment/uncomment to try)
+    if (psramFound()) {
+        Serial.println("PSRAM found");
+        config.jpeg_quality = 7;
+    }
+    
+    //initialize the camera
+    Serial.println("Camera init... ");
+    esp_err_t err = esp_camera_init(&config);
 
-    camerr = cameraImageSettings(frame_size);       // apply camera sensor settings
+    if (err != ESP_OK) {
+        delay(100);    // need a delay here or the next serial o/p gets missed
+        Serial.printf("\n\nCRITICAL FAILURE: Camera sensor failed to initialise.\n\n");
+        Serial.printf("A full (hard, power off/on) reboot will probably be needed to recover from this.\n");
+        return false;
+    } else {
+        Serial.println("succeeded");
+
+        // Get a reference to the sensor
+        sensor_t* s = esp_camera_sensor_get();
+
+        // Dump camera module, warn for unsupported modules.
+        switch (s->id.PID) {
+            case OV9650_PID: Serial.println("WARNING: OV9650 camera module is not properly supported, will fallback to OV2640 operation"); break;
+            case OV7725_PID: Serial.println("WARNING: OV7725 camera module is not properly supported, will fallback to OV2640 operation"); break;
+            case OV2640_PID: Serial.println("OV2640 camera module detected"); break;
+            case OV3660_PID: Serial.println("OV3660 camera module detected"); break;
+            default: Serial.println("WARNING: Camera module is unknown and not properly supported, will fallback to OV2640 operation");
+        }
+    }
+    
+    esp_err_t camerr = cameraImageSettings(frame_size);       // apply camera sensor settings
 
     return (camerr == ESP_OK);                    // return boolean result of camera initilisation
 }
@@ -140,7 +133,6 @@ bool setupCameraHardware(pixformat_t format) {
 // ---------------------------------------------------------------
 //             -apply camera sensor/image settings
 // ---------------------------------------------------------------
-framesize_t cfsize;
 esp_err_t cameraImageSettings(framesize_t fsize) {
     sensor_t *s = esp_camera_sensor_get();
 
@@ -148,8 +140,29 @@ esp_err_t cameraImageSettings(framesize_t fsize) {
         Serial.println("Error: problem getting camera sensor settings");
         return ESP_ERR_NO_MEM;
     }
-    s->set_gain_ctrl(s, 1);                       // auto gain on (1 or 0)
-    s->set_exposure_ctrl(s, 1);                   // auto exposure on (1 or 0)
+
+    s->set_brightness(s, 0);     // -2 to 2
+    s->set_contrast(s, 0);       // -2 to 2
+    s->set_saturation(s, 0);     // -2 to 2
+    s->set_special_effect(s, 0); // 0 to 6 (0 - No Effect, 1 - Negative, 2 - Grayscale, 3 - Red Tint, 4 - Green Tint, 5 - Blue Tint, 6 - Sepia)
+    s->set_whitebal(s, 1);       // 0 = disable , 1 = enable
+    s->set_awb_gain(s, 1);       // 0 = disable , 1 = enable
+    s->set_wb_mode(s, 0);        // 0 to 4 - if awb_gain enabled (0 - Auto, 1 - Sunny, 2 - Cloudy, 3 - Office, 4 - Home)
+    s->set_exposure_ctrl(s, 1);  // 0 = disable , 1 = enable
+    s->set_aec2(s, 0);           // 0 = disable , 1 = enable
+    s->set_ae_level(s, 0);       // -2 to 2
+    s->set_aec_value(s, 300);    // 0 to 1200
+    s->set_gain_ctrl(s, 1);      // 0 = disable , 1 = enable
+    s->set_agc_gain(s, 0);       // 0 to 30
+    s->set_gainceiling(s, (gainceiling_t)0);  // 0 to 6
+    s->set_bpc(s, 0);            // 0 = disable , 1 = enable
+    s->set_wpc(s, 1);            // 0 = disable , 1 = enable
+    s->set_raw_gma(s, 1);        // 0 = disable , 1 = enable
+    s->set_lenc(s, 1);           // 0 = disable , 1 = enable
+    s->set_hmirror(s, 1);        // 0 = disable , 1 = enable
+    s->set_vflip(s, 1);          // 0 = disable , 1 = enable
+    s->set_dcw(s, 1);            // 0 = disable , 1 = enable
+    s->set_colorbar(s, 0);       // 0 = disable , 1 = enable
     return ESP_OK;
 }
 
