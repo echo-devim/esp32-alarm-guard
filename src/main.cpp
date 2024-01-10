@@ -176,7 +176,7 @@ void setup() {
         // if wakeup is caused by PIR sensor, take a photo
         current_mode = BootMode::PHOTO;
     } else if ((current_mode == BootMode::MONITORING) && ((wakeup_reason == 4) || (!enable_detection))) {
-        // if wakeup is caused by timer while monitoring of detection is disabled, just switch mode
+        // if wakeup is caused by timer while monitoring or detection is disabled, just switch mode
         current_mode = BootMode::TELEGRAM;
     }
 
