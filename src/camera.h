@@ -24,7 +24,7 @@
 
 // Image Settings
 // Image sizes: 160x120 (QQVGA), 128x160 (QQVGA2), 176x144 (QCIF), 240x176 (HQVGA), 320x240 (QVGA), 400x296 (CIF), 640x480 (VGA, default), 800x600 (SVGA), 1024x768 (XGA), 1280x1024 (SXGA), 1600x1200 (UXGA)
-#define FRAME_SIZE_PHOTO FRAMESIZE_SVGA
+#define FRAME_SIZE_PHOTO FRAMESIZE_VGA
 //   ---------------------------------------------------------------------------------------------------------------------
 
 
@@ -41,24 +41,6 @@ bool capture_image();
 esp_err_t cameraImageSettings(framesize_t);
 
 
-int lampChannel = 7;                    // a free PWM channel (some channels used by camera)
-const int pwmfreq = 50000;        // 50K pwm frequency
-const int pwmresolution = 9;    // duty cycle bit range
-const int pwmMax = pow(2, pwmresolution) - 1;
-
-// Lamp Control
-void setLamp(int newVal) {
-    if (newVal != -1) {
-        // Apply a logarithmic function to the scale.
-        int brightness = round((pow(2, (1 + (newVal * 0.02))) - 2) / 6 * pwmMax);
-        ledcWrite(lampChannel, brightness);
-        Serial.print("Lamp: ");
-        Serial.print(newVal);
-        Serial.print("%, pwm = ");
-        Serial.println(brightness);
-    }
-}
-
 // ---------------------------------------------------------------
 //                     -Setup camera hardware
 // ---------------------------------------------------------------
@@ -68,8 +50,6 @@ bool setupCameraHardware(pixformat_t format) {
     camera_config_t config;
     framesize_t frame_size = FRAME_SIZE_PHOTO;
 
-    config.ledc_channel = LEDC_CHANNEL_0;
-    config.ledc_timer = LEDC_TIMER_0;
     config.pin_d0 = Y2_GPIO_NUM;
     config.pin_d1 = Y3_GPIO_NUM;
     config.pin_d2 = Y4_GPIO_NUM;
@@ -86,17 +66,19 @@ bool setupCameraHardware(pixformat_t format) {
     config.pin_sccb_scl = SIOC_GPIO_NUM;
     config.pin_pwdn = PWDN_GPIO_NUM;
     config.pin_reset = RESET_GPIO_NUM;
+    config.ledc_timer = LEDC_TIMER_1;
+    config.ledc_channel = LEDC_CHANNEL_1;
     config.xclk_freq_hz = 20000000;      // XCLK 20MHz or 10MHz for OV2640 double FPS (Experimental)
     config.pixel_format = format;        // PIXFORMAT_ + YUV422, GRAYSCALE, RGB565, JPEG, RGB888?
     config.frame_size = frame_size;      // FRAMESIZE_ + QVGA, CIF, VGA, SVGA, XGA, SXGA, UXGA
-    config.jpeg_quality = 10;            // 0-63 lower number means higher quality (can cause failed image capture if set too low at higher resolutions)
+    config.jpeg_quality = 12;            // 0-63 lower number means higher quality (can cause failed image capture if set too low at higher resolutions)
     config.fb_count = 1;                 // if more than one, i2s runs in continuous mode. Use only with JPEG
 
    
     // Best picture quality, but first frame requestes get lost sometimes (comment/uncomment to try)
     if (psramFound()) {
         Serial.println("PSRAM found");
-        config.jpeg_quality = 7;
+        config.jpeg_quality = 10;
     }
     
     //initialize the camera
@@ -147,20 +129,20 @@ esp_err_t cameraImageSettings(framesize_t fsize) {
     s->set_special_effect(s, 0); // 0 to 6 (0 - No Effect, 1 - Negative, 2 - Grayscale, 3 - Red Tint, 4 - Green Tint, 5 - Blue Tint, 6 - Sepia)
     s->set_whitebal(s, 1);       // 0 = disable , 1 = enable
     s->set_awb_gain(s, 1);       // 0 = disable , 1 = enable
-    s->set_wb_mode(s, 0);        // 0 to 4 - if awb_gain enabled (0 - Auto, 1 - Sunny, 2 - Cloudy, 3 - Office, 4 - Home)
+    s->set_wb_mode(s, 0);        // white balance 0 to 4 - if awb_gain enabled (0 - Auto, 1 - Sunny, 2 - Cloudy, 3 - Office, 4 - Home)
     s->set_exposure_ctrl(s, 1);  // 0 = disable , 1 = enable
-    s->set_aec2(s, 0);           // 0 = disable , 1 = enable
+    s->set_aec2(s, 1);           // 0 = disable , 1 = enable
     s->set_ae_level(s, 0);       // -2 to 2
     s->set_aec_value(s, 300);    // 0 to 1200
     s->set_gain_ctrl(s, 1);      // 0 = disable , 1 = enable
     s->set_agc_gain(s, 0);       // 0 to 30
-    s->set_gainceiling(s, (gainceiling_t)0);  // 0 to 6
+    s->set_gainceiling(s, (gainceiling_t)2);  // 0 to 6
     s->set_bpc(s, 0);            // 0 = disable , 1 = enable
     s->set_wpc(s, 1);            // 0 = disable , 1 = enable
     s->set_raw_gma(s, 1);        // 0 = disable , 1 = enable
     s->set_lenc(s, 1);           // 0 = disable , 1 = enable
-    s->set_hmirror(s, 1);        // 0 = disable , 1 = enable
-    s->set_vflip(s, 1);          // 0 = disable , 1 = enable
+    s->set_hmirror(s, 0);        // 0 = disable , 1 = enable
+    s->set_vflip(s, 0);          // 0 = disable , 1 = enable
     s->set_dcw(s, 1);            // 0 = disable , 1 = enable
     s->set_colorbar(s, 0);       // 0 = disable , 1 = enable
     return ESP_OK;
