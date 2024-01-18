@@ -19,6 +19,8 @@ WiFiClientSecure client; //global ssl connection object
 int boot_time = millis();
 int reboot_time_interval = 15000; // time in milliseconds after which the esp32 is rebooted switching behaviour
 bool enable_detection;
+bool night_mode;
+int current_hour;
 
 AsyncTelegram2 tgbot(client);
 int lastmsgID;
@@ -98,6 +100,8 @@ void reboot(BootMode mode) {
         settings.save("photoLastID", photoLastID);
         //Save the last received Telegram command ID in order to avoid to read the same command after the reboot
         settings.save("lastcmdid", lastmsgID);
+        settings.save("nightMode", night_mode);
+        settings.save("hour", current_hour);
         settings.close();
     }
     Serial.println("Triggering reboot..");
@@ -163,21 +167,49 @@ void setup() {
         enable_detection = settings.read("detection", false);
         photoflash = settings.read("photoflash", false);
         photoLastID = settings.read("photoLastID", 0);
+        night_mode = settings.read("nightMode", false);
+        current_hour = settings.read("hour", 0); //hours since midnight 0 - 23 
         // load detection mode
         current_mode = (BootMode)settings.read("bootmode", BootMode::TELEGRAM);
         settings.close();
     }
     delay(100);
     Serial.println("Woke up in mode: "+String(current_mode));
+
+    // if we are in night mode
+    if (night_mode) {
+        // and we're out from the night time range
+        if ((current_hour > 6) && (current_hour != 23)) {
+            Serial.println("Hour: "+String(current_hour)+", day time - disabling detection");
+            enable_detection = false;
+        } else {
+            Serial.println("Hour: "+String(current_hour)+", night time - enabling detection");
+            enable_detection = true;
+        }
+    }
+
     enable_detection ? Serial.println("Detection Enabled") : Serial.println("Detection Disabled");
 
     esp_sleep_wakeup_cause_t wakeup_reason = get_wakeup_reason();
     if (wakeup_reason == 2) {
         // if wakeup is caused by PIR sensor, take a photo
         current_mode = BootMode::PHOTO;
-    } else if ((current_mode == BootMode::MONITORING) && ((wakeup_reason == 4) || (!enable_detection))) {
-        // if wakeup is caused by timer while monitoring or detection is disabled, just switch mode
-        current_mode = BootMode::TELEGRAM;
+    } else if (current_mode == BootMode::MONITORING) {
+        // Reasons why we should switch into telegram mode
+        if ((wakeup_reason == 4)  // if wakeup is caused by timer while monitoring
+        || (!enable_detection)) //or if detection is disabled
+        {
+            current_mode = BootMode::TELEGRAM;
+        } else { //go to sleep monitoring PIR sensor
+            // if deep sleep was not called, go to sleep
+            Serial.println("Going to sleep");
+            esp_sleep_enable_timer_wakeup(waiting_time*1000000);
+            esp_sleep_enable_ext0_wakeup(PIR_PIN, 1);
+            esp_deep_sleep_start();
+            delay(100);
+            //Following code will never be executed after deep sleep
+            Serial.println("you shoudn't see this message");
+        }
     }
 
     // check if we have a photo request, if that's true we initialize camera
@@ -192,14 +224,7 @@ void setup() {
         } else {
             Serial.println("Camera initialised ok");
         }
-    } else if ((current_mode == BootMode::MONITORING) && (enable_detection)) {
-        // if deep sleep was not called, go to sleep
-        Serial.println("Going to sleep");
-        esp_sleep_enable_timer_wakeup(waiting_time*1000000);
-        esp_sleep_enable_ext0_wakeup(PIR_PIN, 1);
-        delay(100);
-        esp_deep_sleep_start();
-    } else {
+    } else if (current_mode == BootMode::TELEGRAM) {
         // Detection not enabled - listen for commands on telegram
 
         // Start WiFi connection
@@ -234,6 +259,15 @@ void setup() {
         } else {
             Serial.println("NOK");
             ESP.restart();
+        }
+
+        //update time
+        struct tm timeinfo;
+        if(!getLocalTime(&timeinfo)){
+            Serial.println("Failed to obtain time");
+        } else {
+            Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
+            current_hour = timeinfo.tm_hour;
         }
     }
 }
@@ -290,17 +324,32 @@ void handleCommands() {
                 doPhotoRequest(true);
             } else if (msg.text.equalsIgnoreCase("/start")) {
                 enable_detection = true;
+                night_mode = false;
                 sendMessage("intrusion detection started");
                 // start now to monitor
                 reboot(BootMode::MONITORING);
+            } else if (msg.text.equalsIgnoreCase("/night")) {
+                enable_detection = true;
+                night_mode = true;
+                sendMessage("intrusion detection started into night mode");
+                // start now to monitor
+                reboot(BootMode::MONITORING);
+            } else if (msg.text.equalsIgnoreCase("/day")) {
+                night_mode = false;
+                sendMessage("intrusion detection set to normal mode");
+                reboot(BootMode::MONITORING);
             } else if ((msg.text.equalsIgnoreCase("/stop") || (msg.text.equalsIgnoreCase("/poweroff")))) {
                 enable_detection = false;
+                night_mode = false;
                 sendMessage("intrusion detection stopped");
             } else if ((msg.text.equalsIgnoreCase("/reboot")) && (!enable_detection)) {
                 sendMessage("Rebooting");
                 reboot(BootMode::TELEGRAM);
             } else if (msg.text.equalsIgnoreCase("/status")) {
-                enable_detection ? sendMessage("intrusion detection stopped") : sendMessage("intrusion detection started");
+                String msg;
+                enable_detection ? msg = "Intrusion detection started." : msg = "Intrusion detection stopped.";
+                night_mode ? msg += " Night mode." : msg += " Normal mode.";
+                sendMessage(msg);
             } else {
                 Serial.print("Unknown command");
             }
@@ -425,10 +474,13 @@ void loop() {
         //now reboot and switch mode to send it to telegram
         reboot(BootMode::TELEGRAM);
     } else if (current_mode == BootMode::TELEGRAM) { // Telegram mode
+        // handle new commands
         handleCommands();
+        // if there is photo, send it to telegram
         if ((photoname != "") && (checkFile(photoname))) {
             Serial.println("Found saved image, sending to telegram");
-            tgbot.sendPhoto(userid, photoname.c_str(), SPIFFS, "Photo from " CAMID);
+            String msg = "Photo "+photoname+" from " CAMID;
+            tgbot.sendPhoto(userid, photoname.c_str(), SPIFFS, msg.c_str());
             photoname = "";
         }
         // when detection is enabled reduce telegram time
