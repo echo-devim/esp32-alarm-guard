@@ -62,9 +62,10 @@ String getLogs() {
     return content;
 }
 
-void log(String message) {
+void log(String message, bool serial_only = false) {
     //Simple log function with basic rotating mechanism
     Serial.println(message);
+    if (serial_only) return;
     String logname = "/logs.txt";
     bool overwrite = false;
     String prev_content = "";

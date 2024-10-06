@@ -12,7 +12,6 @@
 
 /* Code for FREENOVE ESP32-S3 WROOM 1 chip equipped with a MAX9814 microphone */
 
-#define RGB_BRIGHTNESS 64 // Change white brightness (max 255)
 WiFiClientSecure client; //global ssl connection object
 AsyncTelegram2 tgbot(client);
 int lastmsgID;
@@ -20,11 +19,16 @@ bool enable_detection;
 bool night_mode;
 bool photoflash;
 int photoLastID;
+bool audio_detection = false;
 uint8_t prev_img[30720] = {0,}; // (640*480)/10
 unsigned int changes = 0; // How many pixel changed in two consecutive photos
 TaskHandle_t task_mic; //background task for microphone
 int audio_detected = 0;
 bool debug = false;
+int pix_diff_threshold = 50;
+unsigned long boot_time;
+bool stop_too_dark = false; //stop detection because it's too dark
+unsigned long last_connection = 0;
 
 /* Function signatures */
 void saveSettings();
@@ -39,10 +43,10 @@ int audioDetection(uint8_t seconds, int threshold = 1700);
 /* --- */
 
 // Arduino code by default runs on CORE 1
-// Create a parallel function to run on CORE 2
+// Create a parallel function to run on CORE 0
 void task_worker( void * parameter) {
     for(;;) {
-        if (enable_detection) {
+        if (audio_detection) {
             // Listen for 2 second to detect sounds
             audio_detected = audioDetection(2);
         }
@@ -66,6 +70,8 @@ void setup() {
         neopixelWrite(RGB_BUILTIN, 0, 0, 0);  // Off / black
     }
 
+    boot_time = millis();
+
     #ifdef DEBUG
     dumpChipInfo();
     #endif
@@ -79,7 +85,7 @@ void setup() {
     } else {
         log("SPI flash Total bytes: " + String(LittleFS.totalBytes()));
         log("SPI flash Used bytes: " + String(LittleFS.usedBytes()));
-        listDir(LittleFS, "/", 1);
+        //listDir(LittleFS, "/", 1);
     }
 
     Settings settings;
@@ -94,6 +100,8 @@ void setup() {
         night_mode = settings.read("nightMode", false);
         lastmsgID = settings.read("lastmsgID", -1);
         debug = settings.read("debug", false);
+        audio_detection = settings.read("audio_detection", false);
+        last_connection = settings.read("last_connection", 0);
         settings.close();
     }
 
@@ -121,12 +129,6 @@ void setup() {
         default: log("WARNING: Camera module is unknown and not properly supported, will fallback to OV2640 operation");
     }
 
-    // Warm up the camera by taking a photo
-    camera_fb_t * fb = NULL;
-    fb = esp_camera_fb_get();
-    delay(100);
-    esp_camera_fb_return(fb); // dispose the buffered image
-
     log("Starting wifi..");
     // Start WiFi connection
     log("Connecting to " + String(ssid));
@@ -150,7 +152,7 @@ void setup() {
     configTzTime(MYTZ, "time.google.com", "time.windows.com", "pool.ntp.org");
     client.setInsecure();
 
-    client.setTimeout(30000);
+    client.setTimeout(12000);
 
     // Set the Telegram bot properties
     tgbot.setUpdateTime(1000);
@@ -184,7 +186,7 @@ void setup() {
 
 void loop() {
     //Serial.println("loop function");
-    // check wifi connection status
+    // check wifi and telegram connection status
     int attempts = 3;
     while ((WiFi.status() != WL_CONNECTED) && (attempts > 0)) {
         log("Status: "+get_wifi_status(WiFi.status()));
@@ -202,6 +204,18 @@ void loop() {
         reboot();
     }
     neopixelWrite(RGB_BUILTIN, 0, 0, 0);
+
+    // save the last successful connection
+    time_t rawtime; 
+    struct tm* timeinfo; 
+    time(&rawtime);
+    double difft = difftime((time_t)rawtime, last_connection);
+    if ((last_connection > 0) && (difft > 60000*10)) {
+        sendMessage("Disconnected from telegram for "+String(difft/60000)+" minutes");
+    }
+    log("Disconnected from telegram for "+String(difft)+" seconds");
+    last_connection = rawtime;
+
     // check chip temperature
     float result = 0;
     temp_sensor_read_celsius(&result);
@@ -213,35 +227,69 @@ void loop() {
         esp_deep_sleep_start();
     }
 
+    // check environment light (day or night)
+    // reset sensor config (default: day mode)
+    setSensorMode(true);
+    // check environment brightness
+    if (isNight()) {
+        log("Set detection into night mode");
+        //put sensor into night mode
+        setSensorMode(false);
+        // reset prev image pixels
+        memset(prev_img, 0, sizeof(prev_img));
+        //check again if it's too dark
+        if (isNight()) {
+            if (enable_detection) {
+                //too dark, we cannot perform any detection
+                enable_detection = false;
+                stop_too_dark = true;
+                log("Detection disabled, it's too dark");
+            }
+        } else { //the photo is not too dark, we can perform detection
+            if (stop_too_dark) { // if we stop before bc it was too dark, then re-enable detection
+                stop_too_dark = false;
+                enable_detection = true;
+                log("Detection enabled, it's not dark");
+            }
+            pix_diff_threshold = 30;
+            if ((night_mode) && (!enable_detection)) {
+                log("Night mode: enabling detection");
+                enable_detection = true;
+            }
+        }
+    } else {
+        if (stop_too_dark) { // if we stop before bc it was too dark, then re-enable detection
+            stop_too_dark = false;
+            enable_detection = true;
+            log("Detection enabled, it's not dark");
+        }
+        log("Set detection into day mode");
+        // reset prev image pixels
+        memset(prev_img, 0, sizeof(prev_img));
+        pix_diff_threshold = 40;
+        if (night_mode && enable_detection) {
+            log("Night mode: disabling detection");
+            enable_detection = false;
+        }
+    }
+
     // handle new commands
     handleCommands();
     delay(1000);
 
-    if (night_mode) {
-        if (isNight()) {
-            if (!enable_detection) {
-                log("Night mode: enabling detection");
-                enable_detection = true;
-            }
-        } else {
-            if (enable_detection) {
-                log("Night mode: disabling detection");
-                enable_detection = false;
-            }
+    if (audio_detection) {
+        if (audio_detected > 0) {
+            String m = "Audio Detected. Value: "+String(audio_detected);
+            sendMessage(m);
         }
     }
 
     if (enable_detection) {
-        if (audio_detected > 0) {
-            String m = "Audio Detected. Value: "+String(audio_detected);
-            log(m);
-            sendMessage(m);
-        }
         //log("detecting motion...");
-        //detectMotion(); //initialize
+        detectMotion(); //initialize prev img
         bool confident_detection = true;
         for(int i = 0; i < 1; i++) {
-            delay(2000);
+            delay(1000);
             confident_detection = confident_detection && detectMotion();
         }
         if (confident_detection) {
@@ -252,12 +300,20 @@ void loop() {
     }
     //Serial.println("end loop");
 }
+
+
 // ------ AUDIO DETECTION ------------
 int audioDetection(uint8_t seconds, int threshold) {
     // Listen the mic for input seconds looking for loud sounds
     // Returns the ADC value
+    int r = analogRead(MICROPHONE_PIN);
+    if (r == 0) {
+        log("Mic not present or not working, disabling audio detection");
+        audio_detection = false;
+        return 0;
+    }
     for (int i = 0; i < 20*seconds; i++) {
-        int r = analogRead(MICROPHONE_PIN);
+        r = analogRead(MICROPHONE_PIN);
         //Serial.println(String(r));
         if (r > threshold) {
             return r;
@@ -268,9 +324,13 @@ int audioDetection(uint8_t seconds, int threshold) {
 }
 // ------ MOTION DETECTION -----------
 bool isNight() {
-    camera_fb_t * fb = esp_camera_fb_get();
-    delay(50); 
+    camera_fb_t * fb = NULL;
+    // Dispose the first photo
+    fb = esp_camera_fb_get();
+    esp_camera_fb_return(fb);
+    delay(200);
 
+    fb = esp_camera_fb_get();
     if (!fb) {
         log("Camera capture failed");
         esp_camera_fb_return(fb);
@@ -292,7 +352,7 @@ bool isNight() {
     size_t j = 0;
     changes = 0;
     unsigned int pix_avg = 0;
-    for (size_t i = 0; i < rgb_len; i+=3) {
+    for (size_t i = 0; i < rgb_len; i+=60) {
         // pixel values from 0 to 255
         unsigned int pixel_blue = rgb_buf[i];
         unsigned int pixel_green = rgb_buf[i+1];
@@ -305,15 +365,20 @@ bool isNight() {
     // Clear buffer
     esp_camera_fb_return(fb);
     #ifdef DEBUG
-    log("Night mode checking, avg brightness: "+String(pix_avg));
+    Serial.println("Night mode checking, avg brightness: "+String(pix_avg));
     #endif
-    return (pix_avg < 50);
+    return (pix_avg < 25);
 }
 
 bool detectMotion() {
     // Detect motion comparing pixels average value to previous photo
     // N.B. We don't need to compare every pixel, just some of them are enough
-    camera_fb_t * fb = NULL;   
+    camera_fb_t * fb = NULL;
+    // Dispose the first photo
+    fb = esp_camera_fb_get();
+    esp_camera_fb_return(fb);
+    delay(200);
+
     if (photoflash) {
         neopixelWrite(RGB_BUILTIN, 255, 255, 255);  // White / Flash
         delay(100);        
@@ -322,8 +387,8 @@ bool detectMotion() {
         neopixelWrite(RGB_BUILTIN, 0, 0, 0);  // Off / black
     } else {
         fb = esp_camera_fb_get();
-        delay(50); 
     }
+    delay(200);
 
     if (!fb) {
         log("Camera capture failed");
@@ -350,14 +415,13 @@ bool detectMotion() {
         unsigned int pixel_blue = rgb_buf[i];
         unsigned int pixel_green = rgb_buf[i+1];
         unsigned int pixel_red = rgb_buf[i+2];
-        unsigned int pix_avg = (pixel_blue + pixel_red + pixel_green) / 3;
+        unsigned int pix_avg = (unsigned int)((float)(pixel_blue + pixel_red + pixel_green) / 3);
         //we don't need to store the value of each pixel, but only few pixels are enough (save memory)
         if (i % 10 == 0) { //skip 30 pixels
             if (prev_img[j] != 0) { //0 is the default value, skip the comparation if prev_img[j] is 0
                 int pix_diff = pix_avg - prev_img[j];
                 pix_diff = pix_diff > 0 ? pix_diff : pix_diff*-1;
-                int threshold = 40;
-                if (pix_diff > threshold) {
+                if (pix_diff > pix_diff_threshold) {
                     if (debug) {
                         // For debug purposes, mark as red pixel
                         rgb_buf[i+2] = 255;
@@ -375,7 +439,7 @@ bool detectMotion() {
     size_t out_len = 0;
     float perc_changes = ((float)changes/j)*100; // j=48000
     if (debug) {
-        log("Found "+String(perc_changes)+" changes");
+        log("Found "+String(perc_changes)+" changes", (perc_changes == 0));
         fmt2jpg(rgb_buf, rgb_len, fb->width, fb->height, PIXFORMAT_RGB888, 90, &jpg_out, &out_len);
     } else {
         jpg_out = fb->buf;
@@ -444,6 +508,10 @@ void doPhotoRequest() {
 
     log("Camera capture requested");
     camera_fb_t * fb = NULL;
+    // Dispose the first photo to force an update
+    fb = esp_camera_fb_get();
+    esp_camera_fb_return(fb);
+    delay(200);
     
     if (photoflash) {
         neopixelWrite(RGB_BUILTIN, 255, 255, 255);  // White / Flash
@@ -453,8 +521,8 @@ void doPhotoRequest() {
         neopixelWrite(RGB_BUILTIN, 0, 0, 0);  // Off / black
     } else {
         fb = esp_camera_fb_get();
-        delay(50);
     }
+    delay(200);
 
     if (!fb) {
         log("Camera capture failed");
@@ -483,12 +551,13 @@ void handleCommands() {
             if (pos > 0) {
                 String camName = msg.text.substring(1, pos);
                 String command = "/"+msg.text.substring(pos+1);
-                if ((camName != CAMID)||(camName != GROUPID)) {
+                if ((camName == CAMID) || (camName == GROUPID)) {
+                    log("Received a private message, command: " + command);
+                    msg.text = command;
+                } else {
                     log(camName + " is not the ID of this camera, expected: " CAMID);
                     return;
                 }
-                log("Received a private message, command: " + command);
-                msg.text = command;
             }
             // Received a text message
             if ((msg.text.startsWith("/photo")) || (msg.text.startsWith("/getphoto"))) {
@@ -531,6 +600,9 @@ void handleCommands() {
             } else if (msg.text.equalsIgnoreCase("/debug")) {
                 debug = !debug;
                 sendMessage("Setting debug to "+String(debug));
+            } else if (msg.text.equalsIgnoreCase("/audio")) {
+                audio_detection = !audio_detection;
+                sendMessage("Setting audio detection to "+String(audio_detection));
             } else if (msg.text.equalsIgnoreCase("/stop")) {
                 enable_detection = false;
                 night_mode = false;
@@ -539,17 +611,20 @@ void handleCommands() {
             } else if ((msg.text.equalsIgnoreCase("/reboot")) && (!enable_detection)) {
                 sendMessage("Rebooting");
                 reboot();
-            } else if ((msg.text.equalsIgnoreCase("/poweroff")) && (!enable_detection)) {
+            } else if ((msg.text.equalsIgnoreCase("/poweroff")) && (!enable_detection) && ((millis() - boot_time) > 60000*3)) {
                 saveSettings();
                 log("poweroff received, going to deep sleep");
                 sendMessage("bye");
                 delay(2000);
                 esp_deep_sleep_start();
             } else if (msg.text.equalsIgnoreCase("/status")) {
+                float t = 0;
+                temp_sensor_read_celsius(&t);
                 String msg;
                 enable_detection ? msg = "Intrusion detection started." : msg = "Intrusion detection stopped.";
                 night_mode ? msg += " Night mode." : msg += " Normal mode.";
-                msg += " Free space: " + String(((LittleFS.totalBytes()-LittleFS.usedBytes())/1024)) + "KB";
+                msg += " Free space: " + String(((LittleFS.totalBytes()-LittleFS.usedBytes())/1024)) + "KB.";
+                msg += " Temp: "+String(t)+"°C.";
                 msg += " SW Ver: " SW_VERSION;
                 sendMessage(msg);
             } else {
@@ -586,6 +661,8 @@ void saveSettings() {
         settings.save("lastmsgID", lastmsgID);
         settings.save("photoflash", photoflash);
         settings.save("debug", debug);
+        settings.save("audio_detection", audio_detection);
+        settings.save("last_connection", last_connection);
         settings.close();
     }
 }
