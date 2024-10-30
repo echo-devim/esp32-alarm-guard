@@ -50,8 +50,8 @@ public:
 String getLogs() {
     String logname = "/logs.txt";
     String content = "";
-    if (LittleFS.exists(logname)) {
-        File f = LittleFS.open(logname, FILE_READ);
+    if (mem.exists(logname)) {
+        File f = mem.open(logname, FILE_READ);
         if (!f) {
             Serial.println("ERROR: Cannot read logs file");
             return content;
@@ -69,14 +69,14 @@ void log(String message, bool serial_only = false) {
     String logname = "/logs.txt";
     bool overwrite = false;
     String prev_content = "";
-    if (LittleFS.exists(logname)) {
-        File f = LittleFS.open(logname, FILE_READ);
+    if (mem.exists(logname)) {
+        File f = mem.open(logname, FILE_READ);
         if (!f) {
             Serial.println("ERROR: Cannot read logs file");
             return;
         }
         size_t filesize = f.size();
-        if (filesize > 1024) {
+        if (filesize > LOG_SIZE) {
             overwrite = true;
             prev_content += f.readString();
         }
@@ -91,8 +91,8 @@ void log(String message, bool serial_only = false) {
     strftime(datestr, 80, "%d%m%Y %H:%M:%S",timeinfo);
     message = String(datestr) + " " + message + "\n";
     if (overwrite) {
-        message = prev_content.substring(1024) + message;
-        File f = LittleFS.open(logname, FILE_WRITE);
+        message = prev_content.substring(prev_content.length()-1024) + message;
+        File f = mem.open(logname, FILE_WRITE);
         if (!f) {
             Serial.println("ERROR: Cannot open logs file");
             return;
@@ -100,7 +100,7 @@ void log(String message, bool serial_only = false) {
         f.write((uint8_t*) message.c_str(), message.length());
         f.close();
     } else {
-        File f = LittleFS.open(logname, FILE_APPEND);
+        File f = mem.open(logname, FILE_APPEND);
         if (!f) {
             Serial.println("ERROR: Cannot open logs file");
             return;
@@ -184,4 +184,8 @@ void listDir(fs::FS &fs, const char * dirname, uint8_t levels){
         }
         file = root.openNextFile();
     }
+}
+
+bool freespaceAvailable(size_t threshold = 5242880) { // by default check if we have at least 5KB of free space
+    return ((mem.totalBytes()-mem.usedBytes()) > threshold);
 }

@@ -1,3 +1,4 @@
+/* Code for FREENOVE ESP32-S3 WROOM 1 chip equipped with a INMP441 microphone */
 #include <Arduino.h>
 
 #include <AsyncTelegram2.h>
@@ -9,8 +10,15 @@
 #include "driver/temp_sensor.h"
 #include <WiFiClientSecure.h>
 #include <nvs_flash.h>
+#include <cmath>
+#include <mutex>
+#include <vector>
+#include "microphone.h"
+#include "SD_MMC.h"
 
-/* Code for FREENOVE ESP32-S3 WROOM 1 chip equipped with a MAX9814 microphone */
+#define SD_MMC_CMD 38 //Please do not modify it.
+#define SD_MMC_CLK 39 //Please do not modify it. 
+#define SD_MMC_D0  40 //Please do not modify it.
 
 WiFiClientSecure client; //global ssl connection object
 AsyncTelegram2 tgbot(client);
@@ -23,35 +31,42 @@ bool audio_detection = false;
 uint8_t prev_img[30720] = {0,}; // (640*480)/10
 unsigned int changes = 0; // How many pixel changed in two consecutive photos
 TaskHandle_t task_mic; //background task for microphone
-int audio_detected = 0;
+int audio_detected = 0; // greater than 0 for successful detection
 bool debug = false;
 int pix_diff_threshold = 50;
 unsigned long boot_time;
+short alarms = 0; //alarm counter
+unsigned long last_alarm_sent = 0;
 bool stop_too_dark = false; //stop detection because it's too dark
 unsigned long last_connection = 0;
+#define DEFAULT_AUDIO_THRESHOLD 20 // we'll always have a little bit of noise
+#define MAX_AUDIO_ANOMALIES 1500 // how many samples are greater than DEFAULT_AUDIO_THRESHOLD value
+int audio_anomalies = MAX_AUDIO_ANOMALIES;
+short min_hour, max_hour = -1; // For time-based detection, set time interval
+
+enum ALARM_TYPE {
+    AUDIO,
+    PHOTO
+};
 
 /* Function signatures */
 void saveSettings();
 void reboot();
-void sendAlarm();
-void doPhotoRequest();
+void sendAlarm(ALARM_TYPE at);
+void sendPhoto();
 bool detectMotion();
 void handleCommands();
 bool isNight();
 void sendMessage(String message);
-int audioDetection(uint8_t seconds, int threshold = 1700);
+int audioDetection(int threshold = MAX_AUDIO_ANOMALIES);
+void sendAudio(int seconds);
 /* --- */
+
 
 // Arduino code by default runs on CORE 1
 // Create a parallel function to run on CORE 0
 void task_worker( void * parameter) {
-    for(;;) {
-        if (audio_detection) {
-            // Listen for 2 second to detect sounds
-            audio_detected = audioDetection(2);
-        }
-        delay(200);
-    }
+    // Not used anymore because intensive background task created issues with wifi connection
 }
 // --- SETUP
 void initTempSensor(){
@@ -77,17 +92,44 @@ void setup() {
     #endif
     initTempSensor();
 
-    // Initialize Spiffs
-    if (!LittleFS.begin(true)) {
+    #ifdef USE_MICROSD
+    // Initialize SD card if present
+    mem.setPins(SD_MMC_CLK, SD_MMC_CMD, SD_MMC_D0);
+    if (!mem.begin("/sdcard", true, true, SDMMC_FREQ_DEFAULT, 5)) {
+      Serial.println("Card Mount Failed");
+      return;
+    }
+    uint8_t cardType = mem.cardType();
+    if(cardType == CARD_NONE){
+        Serial.println("No SD_MMC card attached");
+        return;
+    }
+
+    Serial.print("SD_MMC Card Type: ");
+    if(cardType == CARD_MMC){
+        Serial.println("MMC");
+    } else if(cardType == CARD_SD){
+        Serial.println("SDSC");
+    } else if(cardType == CARD_SDHC){
+        Serial.println("SDHC");
+    } else {
+        Serial.println("UNKNOWN");
+    }
+
+    uint64_t cardSize = mem.cardSize() / (1024 * 1024);
+    Serial.printf("SD_MMC Card Size: %lluMB\n", cardSize);
+    #else
+    // Initialize Littlefs
+    if (!mem.begin(true)) {
         log("An Error has occurred while mounting LittleFS - restarting");
         delay(200);
         reboot(); // restart and try again
     } else {
-        log("SPI flash Total bytes: " + String(LittleFS.totalBytes()));
-        log("SPI flash Used bytes: " + String(LittleFS.usedBytes()));
+        log("SPI flash Total bytes: " + String(mem.totalBytes()));
+        log("SPI flash Used bytes: " + String(mem.usedBytes()));
         //listDir(LittleFS, "/", 1);
     }
-
+    #endif
     Settings settings;
     if (!settings.open()) {
         log("ERROR: Cannot open settings!");
@@ -102,6 +144,9 @@ void setup() {
         debug = settings.read("debug", false);
         audio_detection = settings.read("audio_detection", false);
         last_connection = settings.read("last_connection", 0);
+        audio_anomalies = settings.read("audio_anomalies", MAX_AUDIO_ANOMALIES);
+        min_hour = settings.read("min_hour", -1); //hours since midnight 0 - 23
+        max_hour = settings.read("max_hour", -1);
         settings.close();
     }
 
@@ -172,20 +217,19 @@ void setup() {
     enable_detection ? log("Detection Enabled") : log("Detection Disabled");
 
     #ifdef USE_MICROPHONE
-    xTaskCreatePinnedToCore(
-        task_worker, /* Function to implement the task */
-        "task_mic", /* Name of the task */
-        10000,  /* Stack size in words */
-        NULL,  /* Task input parameter */
-        0,  /* Priority of the task */
-        &task_mic,  /* Task handle. */
-        0); /* Core where the task should run */
+    // start up the I2S peripheral
+    if (!i2s_init()) {
+        log("Failed to init i2s!");
+        audio_detection = false;
+    }
     #endif
+
     log("Setup done");
 }
 
 void loop() {
     //Serial.println("loop function");
+    unsigned long start, end;
     // check wifi and telegram connection status
     int attempts = 3;
     while ((WiFi.status() != WL_CONNECTED) && (attempts > 0)) {
@@ -207,13 +251,13 @@ void loop() {
 
     // save the last successful connection
     time_t rawtime; 
-    struct tm* timeinfo; 
     time(&rawtime);
     double difft = difftime((time_t)rawtime, last_connection);
     if ((last_connection > 0) && (difft > 60000*10)) {
         sendMessage("Disconnected from telegram for "+String(difft/60000)+" minutes");
+    } else {
+        log("Disconnected from telegram for "+String(difft)+" seconds");
     }
-    log("Disconnected from telegram for "+String(difft)+" seconds");
     last_connection = rawtime;
 
     // check chip temperature
@@ -228,6 +272,7 @@ void loop() {
     }
 
     // check environment light (day or night)
+    start = millis();
     // reset sensor config (default: day mode)
     setSensorMode(true);
     // check environment brightness
@@ -272,55 +317,163 @@ void loop() {
             enable_detection = false;
         }
     }
+    end = millis();
+    Serial.printf("Environment brightness task: %lu ms\n", (end-start));
 
     // handle new commands
+    start = millis();
     handleCommands();
-    delay(1000);
+    end = millis();
+    Serial.printf("Handled command in %lu ms\n", (end-start));
 
-    if (audio_detection) {
-        if (audio_detected > 0) {
-            String m = "Audio Detected. Value: "+String(audio_detected);
-            sendMessage(m);
-        }
+    //update time
+    struct tm timeinfo;
+    if(!getLocalTime(&timeinfo)){
+        Serial.println("Failed to obtain time");
+    } else {
+        Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
     }
-
-    if (enable_detection) {
+ 
+    if ((enable_detection) && // detection is enabled?
+        // Check if we have some time interval configured
+        (((min_hour < 0) && (max_hour < 0)) || ((timeinfo.tm_hour >= min_hour) && (timeinfo.tm_hour <= max_hour)))
+        ) {
+        start = millis();
         //log("detecting motion...");
         detectMotion(); //initialize prev img
         bool confident_detection = true;
         for(int i = 0; i < 1; i++) {
+            #ifndef USE_MICROPHONE
             delay(1000);
+            #else
+            // here we need some delay between the two photos. We can listen the microphone performing sound detection
+            // in order to have a more optimized overall detection
+            if (audio_detection) {
+                // Listen to detect sounds
+                audio_detected = audioDetection(audio_anomalies);
+                if (audio_detected > 0) {
+                    sendAlarm(ALARM_TYPE::AUDIO);
+                }
+            } else {
+                delay(1000);
+            }
+            #endif
             confident_detection = confident_detection && detectMotion();
         }
         if (confident_detection) {
-            sendAlarm();
+            sendAlarm(ALARM_TYPE::PHOTO);
         }
+        end = millis();
+        Serial.printf("Detection performed in %lu ms\n", (end-start));
     } else {
         delay(1000);
     }
-    //Serial.println("end loop");
+    Serial.println("end loop");
 }
 
+// AUDIO ------
+
+void sendAudio(int seconds) {
+    bool prev = audio_detection;
+    audio_detection = false; //temporary disable audio detection
+    String filename = "/audio.wav";
+    if (mem.exists(filename)) {
+        mem.remove(filename);
+    }
+    delay(1000);
+    if (freespaceAvailable() && !audio_detection) { // check if we have enough space
+        // Microphone it's also used for audio detection in the background task running on CORE 0
+        File f = mem.open(filename, FILE_WRITE);
+        recordAudio(f, seconds);
+        f.close();
+    } else {
+        sendMessage("Not enough space to store audio or audio detection enabled");
+        audio_detection = prev;
+        return;
+    }
+    audio_detection = prev;
+    
+    Serial.println("Sending to telegram");
+    File fwr = mem.open(filename, FILE_READ);
+    if (!fwr) {
+        Serial.println("Error while opening fwr");
+    } else {
+        Serial.println("Sending "+filename+" with size of "+String(fwr.size()));
+    }
+    String unique_name = "Audio_" + String(micros()) + ".wav";
+    tgbot.sendDocument(userid, fwr, fwr.size(), AsyncTelegram2::BINARY, unique_name.c_str(), "audio");
+    delay(3000);
+    fwr.close();
+}
 
 // ------ AUDIO DETECTION ------------
-int audioDetection(uint8_t seconds, int threshold) {
-    // Listen the mic for input seconds looking for loud sounds
-    // Returns the ADC value
-    int r = analogRead(MICROPHONE_PIN);
-    if (r == 0) {
-        log("Mic not present or not working, disabling audio detection");
-        audio_detection = false;
+int audioDetection(int threshold) {
+    // Listen the mic looking for loud sounds greater than threshold
+    size_t numBytesRead;
+    size_t buf_len = 32000; // number of audio samples to capture from mic
+    uint8_t *buffer = (uint8_t*)malloc(buf_len);
+    if (!buffer) {
+        log("Error: cannot allocate memory");
         return 0;
     }
-    for (int i = 0; i < 20*seconds; i++) {
-        r = analogRead(MICROPHONE_PIN);
-        //Serial.println(String(r));
-        if (r > threshold) {
-            return r;
+    int res = 0;
+    // Read data from DMA buffers into our copy buffer
+    i2s_read(I2S_NUM_0, (void*)buffer, buf_len, &numBytesRead, portMAX_DELAY);
+    const int16_t *samples = (const int16_t *)buffer;
+    int num_samples = buf_len / sizeof(int16_t);
+    int16_t maxsample = INT16_MIN, minsample = INT16_MAX, abssample;
+    int anomalies = 0;
+    int avg = 0;
+    int16_t avg_freq, freq_count, freq = 0;
+    for (int i = 0; i < num_samples; i++) {
+        minsample = min(minsample, samples[i]);
+        maxsample = max(maxsample, samples[i]);
+        //abssample = abs(samples[i]);
+        // Consider only positive samples (they are half of num_samples)
+        if (samples[i] > 0) {
+            avg += samples[i];
+            freq++;
+            if (samples[i] > DEFAULT_AUDIO_THRESHOLD) {
+                anomalies++;
+            }
+        } else {
+            if (freq > 0) { // passing from positive values to negative
+                avg_freq += freq;
+                freq_count++;
+            }
+            freq = 0; // reset freq
         }
-        delay(50);
     }
-    return 0;
+    avg_freq /= freq_count;
+    avg /= (num_samples/2);
+    int16_t amp = maxsample - abs(minsample); //min sample is likely negative
+    //Serial.printf("Audio debug: %d samples, %d min, %d max, %d amp, %d avg\n", num_samples, minsample, maxsample, amp, avg);
+    if (debug) log("Audio anomalies: "+String(anomalies)+", Avg Frequency:"+String(avg_freq));
+    if ((avg_freq < 8) || // if we have a signal with high frequency probably it's an acoustic alarm, we must detect it
+        (anomalies > threshold)) { // otherwise filter the anomaly amplitudes using a threshold
+        // Sound detected!
+        res = anomalies;
+    }
+
+    if ((res > 0) && (freespaceAvailable())) {
+        String filename = "/detection.wav";
+        if (mem.exists(filename)) {
+            mem.remove(filename);
+        }
+        log("Saving " + filename);
+        // Save to file
+        const int audio_size = buf_len;
+        WAVHeader wavHeader;
+        initializeWAVHeader(wavHeader, audio_size);
+        File f = mem.open(filename, FILE_WRITE);
+        f.write(reinterpret_cast<const uint8_t*>(&wavHeader), sizeof(wavHeader));
+        f.write((const byte*)buffer, buf_len);
+        f.close();
+    }
+
+    free(buffer);
+
+    return res;
 }
 // ------ MOTION DETECTION -----------
 bool isNight() {
@@ -377,7 +530,6 @@ bool detectMotion() {
     // Dispose the first photo
     fb = esp_camera_fb_get();
     esp_camera_fb_return(fb);
-    delay(200);
 
     if (photoflash) {
         neopixelWrite(RGB_BUILTIN, 255, 255, 255);  // White / Flash
@@ -388,7 +540,6 @@ bool detectMotion() {
     } else {
         fb = esp_camera_fb_get();
     }
-    delay(200);
 
     if (!fb) {
         log("Camera capture failed");
@@ -460,19 +611,19 @@ bool detectMotion() {
         photoLastID = ++photoLastID % MAX_PHOTO_SAVED;
         String photoname = "/photo"+String(photoLastID)+".jpg";
         // delete old image file if it exists
-        if (LittleFS.exists(photoname)) {
+        if (mem.exists(photoname)) {
             Serial.println(photoname + " already exists, overwriting..");
-            LittleFS.remove(photoname);
+            mem.remove(photoname);
         }
         // save the new image
-        File file = LittleFS.open(photoname, FILE_WRITE);
+        File file = mem.open(photoname, FILE_WRITE);
         if (!file) {
-            log("Failed to create file in LittleFS");
+            log("Failed to create file");
         } else {
             if (file.write(jpg_out, out_len)) {
                 log("The picture " + String(photoLastID) + " has been saved");
             } else {
-                log("Error: writing image to LittleFS, retrying..");
+                log("Error: writing image, retrying..");
                 delay(300);
                 if (file.write(jpg_out, out_len)) {
                     log("The picture " + String(photoLastID) + " has been saved");
@@ -503,7 +654,7 @@ void sendMessage(String message) {
     delay(1000);
 }
 
-void doPhotoRequest() {
+void sendPhoto() {
     // Send a photo via telegram without saving it on filesystem
 
     log("Camera capture requested");
@@ -538,8 +689,8 @@ void handleCommands() {
     // A variable to store telegram message data
     TBMessage msg;
     // if there is an incoming message...
-    if (tgbot.getNewMessage(msg)) {
-        MessageType msgType = msg.messageType;
+    MessageType msgType = tgbot.getNewMessage(msg);
+    if (msgType) {
         log("Received "+ String(msg.messageID) + " - " + msg.text + ", last command id was " +String(lastmsgID));
         // we must check if the last command is different from the current command
         // unfortunately, the library fetches always the last command even if it was already read
@@ -568,27 +719,72 @@ void handleCommands() {
                 }
                 log("Sending Photo from CAM");
                 if (num < 0) {
-                    doPhotoRequest();
+                    sendPhoto();
                 } else {
                     String photoname = "/photo"+String(num)+".jpg";
-                    if (LittleFS.exists(photoname)) {
+                    if (mem.exists(photoname)) {
                         String msg = "Photo " + photoname + " from " CAMID;
-                        tgbot.sendPhoto(userid, photoname.c_str(), LittleFS, msg.c_str());
+                        tgbot.sendPhoto(userid, photoname.c_str(), mem, msg.c_str());
                     } else {
                         sendMessage(photoname+" not found");
                     }
                 }
+            } else if (msg.text.startsWith("/getaudio")) {
+                log("Sending recording to telegram");
+                short num = 5;
+                int separator = msg.text.indexOf(" ");
+                if (separator > 0) {
+                    num = msg.text.substring(separator+1).toInt();
+                }
+                sendAudio(num);
+            } else if (msg.text.startsWith("/setaudio")) {
+                int num = MAX_AUDIO_ANOMALIES;
+                int separator = msg.text.indexOf(" ");
+                if (separator > 0) {
+                    num = msg.text.substring(separator+1).toInt();
+                    sendMessage("Setting audio threshold to "+String(num));
+                    audio_anomalies = num;
+                } else {
+                    sendMessage("Setting audio threshold to default value");
+                    audio_anomalies = num;
+                }
             } else if (msg.text.equalsIgnoreCase("/flash")) {
                 log("Sending Photo from CAM with flash");
                 photoflash = true;
-                doPhotoRequest();
+                sendPhoto();
                 photoflash = false;
-            } else if (msg.text.equalsIgnoreCase("/start")) {
+            } else if (msg.text.startsWith("/start")) {
+                int separator = msg.text.indexOf(" ");
+                if (separator > 0) {
+                    String interval = msg.text.substring(separator+1);
+                    separator = interval.indexOf("-");
+                    if (separator > 0) {
+                        min_hour = interval.substring(0,separator).toInt();
+                        max_hour = interval.substring(separator+1).toInt();
+                        sendMessage("Configured min hour to "+String(min_hour)+" and max hour to "+String(max_hour));
+                    }
+                } else {
+                    min_hour = -1;
+                    max_hour = -1;
+                }
                 enable_detection = true;
                 night_mode = false;
                 saveSettings();
                 sendMessage("intrusion detection started");                
-            } else if (msg.text.equalsIgnoreCase("/night")) {
+            } else if (msg.text.startsWith("/night")) {
+                int separator = msg.text.indexOf(" ");
+                if (separator > 0) {
+                    String interval = msg.text.substring(separator+1);
+                    separator = interval.indexOf("-");
+                    if (separator > 0) {
+                        min_hour = interval.substring(0,separator).toInt();
+                        max_hour = interval.substring(separator+1).toInt();
+                        sendMessage("Configured min hour to "+String(min_hour)+" and max hour to "+String(max_hour));
+                    }
+                } else {
+                    min_hour = -1;
+                    max_hour = -1;
+                }
                 enable_detection = true;
                 night_mode = true;
                 sendMessage("intrusion detection started into night mode");
@@ -596,7 +792,18 @@ void handleCommands() {
                 night_mode = false;
                 sendMessage("intrusion detection set to normal mode");
             } else if (msg.text.equalsIgnoreCase("/logs")) {
-                sendMessage(getLogs());
+                String logname = "/logs.txt";
+                if (mem.exists(logname)) {
+                    File f = mem.open(logname, FILE_READ);
+                    if (!f) {
+                        sendMessage("Cannot read logs file");
+                    } else {
+                        tgbot.sendDocument(userid, f, f.size(), AsyncTelegram2::TEXT, "logs.txt", "logs");
+                    }
+                    f.close();
+                } else {
+                    sendMessage("Logs file doesn't exist");
+                }
             } else if (msg.text.equalsIgnoreCase("/debug")) {
                 debug = !debug;
                 sendMessage("Setting debug to "+String(debug));
@@ -623,7 +830,7 @@ void handleCommands() {
                 String msg;
                 enable_detection ? msg = "Intrusion detection started." : msg = "Intrusion detection stopped.";
                 night_mode ? msg += " Night mode." : msg += " Normal mode.";
-                msg += " Free space: " + String(((LittleFS.totalBytes()-LittleFS.usedBytes())/1024)) + "KB.";
+                msg += " Free space: " + String(((mem.totalBytes()-mem.usedBytes())/1024)) + "KB.";
                 msg += " Temp: "+String(t)+"°C.";
                 msg += " SW Ver: " SW_VERSION;
                 sendMessage(msg);
@@ -634,20 +841,45 @@ void handleCommands() {
     }
 }
 
-void sendAlarm() {
-    if (debug) {
-        neopixelWrite(RGB_BUILTIN, 208, 52, 223);
-        delay(200);
-        neopixelWrite(RGB_BUILTIN, 0, 0, 0);
+void sendAlarm(ALARM_TYPE at) {
+    // check if we already sent enough alarms in less than 5 minutes
+    unsigned long now = millis();
+    Serial.printf("sendAlarm called, alarm count: %d, ms from last alarm: %lu\n", alarms, now-last_alarm_sent);
+    if ((alarms < 5) // if we sent less than 5 alarms..
+        || ((last_alarm_sent == 0) || (now-last_alarm_sent > 60000*2))) { // or the last time we sent it was more than 2 minutes
+        //send the alarm
+        if (at == ALARM_TYPE::PHOTO) {
+            if (debug) {
+                neopixelWrite(RGB_BUILTIN, 208, 52, 223);
+                delay(200);
+                neopixelWrite(RGB_BUILTIN, 0, 0, 0);
+            }
+            log("Sending alarm MOTION DETECTED!");
+            //send to telegram last image saved (ID)
+            String photoname = "/photo"+String(photoLastID)+".jpg";
+            String msg = "MOTION DETECTED. Photo " + photoname + " from " CAMID;
+            // send text first
+            sendMessage(msg);
+            // try to upload the picture
+            tgbot.sendPhoto(userid, photoname.c_str(), mem, "");
+        } else if (at == ALARM_TYPE::AUDIO) {
+            String m = "Audio Detected! Anomalies: "+String(audio_detected);
+            sendMessage(m);
+            File fwr = mem.open("/detection.wav", FILE_READ);
+            log("Sending audio detection of size "+String(fwr.size())+" to telegram");
+            // Telegram sendDocument doesn't overwrite the file if it has the same name
+            String unique_name = "Detection_" + String(micros()) + ".wav";
+            // We must send the wav file as generic binary
+            tgbot.sendDocument(userid, fwr, fwr.size(), AsyncTelegram2::BINARY, unique_name.c_str(), "Sound detected!");
+            delay(2000);
+            fwr.close();
+        }
+        alarms++;
+        if ((last_alarm_sent != 0) && (now-last_alarm_sent > 60000*2)) {
+            alarms = 0;
+        }
+        last_alarm_sent = now;
     }
-    log("Sending alarm MOTION DETECTED!");
-    //send to telegram last image saved (ID)
-    String photoname = "/photo"+String(photoLastID)+".jpg";
-    String msg = "MOTION DETECTED. Photo " + photoname + " from " CAMID;
-    // send text first
-    sendMessage(msg);
-    // try to upload the picture
-    tgbot.sendPhoto(userid, photoname.c_str(), LittleFS, "");
 }
 
 void saveSettings() {
@@ -663,6 +895,9 @@ void saveSettings() {
         settings.save("debug", debug);
         settings.save("audio_detection", audio_detection);
         settings.save("last_connection", last_connection);
+        settings.save("audio_anomalies", audio_anomalies);
+        settings.save("min_hour", min_hour);
+        settings.save("max_hour", max_hour);
         settings.close();
     }
 }
