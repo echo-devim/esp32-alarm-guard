@@ -20,6 +20,22 @@
 #define SD_MMC_CLK 39 //Please do not modify it. 
 #define SD_MMC_D0  40 //Please do not modify it.
 
+enum ALARM_TYPE {
+    AUDIO,
+    PHOTO
+};
+
+class AudioData {
+public:
+    int amp = 0;
+    int freq = 0;
+    AudioData() {};
+    AudioData(AudioData &ad) {  
+        this->amp = ad.amp;
+        this->freq = ad.freq;
+    }  
+};
+
 WiFiClientSecure client; //global ssl connection object
 AsyncTelegram2 tgbot(client);
 int lastmsgID;
@@ -31,23 +47,20 @@ bool audio_detection = false;
 uint8_t prev_img[30720] = {0,}; // (640*480)/10
 unsigned int changes = 0; // How many pixel changed in two consecutive photos
 TaskHandle_t task_mic; //background task for microphone
-int audio_detected = 0; // greater than 0 for successful detection
+AudioData audio_detected; // greater than 0 for successful detection
 bool debug = false;
 int pix_diff_threshold = 50;
+int brightness_threshold = 25; // Minimum average pixel brightness to be considered in day mode
 unsigned long boot_time;
 short alarms = 0; //alarm counter
 unsigned long last_alarm_sent = 0;
 bool stop_too_dark = false; //stop detection because it's too dark
-unsigned long last_connection = 0;
-#define DEFAULT_AUDIO_THRESHOLD 20 // we'll always have a little bit of noise
-#define MAX_AUDIO_ANOMALIES 1500 // how many samples are greater than DEFAULT_AUDIO_THRESHOLD value
-int audio_anomalies = MAX_AUDIO_ANOMALIES;
+unsigned long failed_connection_attempts; // Failed connections attempts to wifi or telegram server
+#define DEFAULT_AMP_THRESHOLD 40 // Signal with an average amplitude greater than the threshold triggers an alarm
+#define DEFAULT_FREQ_THRESHOLD 8 // Signal with an average frequency minor than the threshold (high freq) triggers an alarm
+int audio_amp = DEFAULT_AMP_THRESHOLD;
+int audio_freq = DEFAULT_FREQ_THRESHOLD;
 short min_hour, max_hour = -1; // For time-based detection, set time interval
-
-enum ALARM_TYPE {
-    AUDIO,
-    PHOTO
-};
 
 /* Function signatures */
 void saveSettings();
@@ -58,7 +71,7 @@ bool detectMotion();
 void handleCommands();
 bool isNight();
 void sendMessage(String message);
-int audioDetection(int threshold = MAX_AUDIO_ANOMALIES);
+AudioData audioDetection();
 void sendAudio(int seconds);
 /* --- */
 
@@ -143,10 +156,12 @@ void setup() {
         lastmsgID = settings.read("lastmsgID", -1);
         debug = settings.read("debug", false);
         audio_detection = settings.read("audio_detection", false);
-        last_connection = settings.read("last_connection", 0);
-        audio_anomalies = settings.read("audio_anomalies", MAX_AUDIO_ANOMALIES);
+        failed_connection_attempts = settings.read("failed_connection_attempts", 0);
+        audio_amp = settings.read("audio_amp", DEFAULT_AMP_THRESHOLD);
+        audio_freq = settings.read("audio_freq", DEFAULT_FREQ_THRESHOLD);
         min_hour = settings.read("min_hour", -1); //hours since midnight 0 - 23
         max_hour = settings.read("max_hour", -1);
+        brightness_threshold = settings.read("brightness_threshold", 25);
         settings.close();
     }
 
@@ -187,7 +202,10 @@ void setup() {
         Serial.print(".");
         attempts--;
     }
-    if (attempts == 0) reboot();
+    if (attempts == 0) {
+        failed_connection_attempts++;
+        reboot();
+    }
     neopixelWrite(RGB_BUILTIN, 0, 0, 0);  // Off / black
     log("");
     log("WiFi connected");
@@ -204,13 +222,15 @@ void setup() {
     tgbot.setTelegramToken(token);
 
     // Check if all things are ok
-    Serial.print("\nTest Telegram connection... ");
+    log("\nTest Telegram connection... ");
     bool tg_res = tgbot.begin();
-    delay(1000);
+    delay(5000);
     if (tg_res) {
         log("OK");
     } else {
+        failed_connection_attempts++;
         log("NOK");
+        delay(3000);
         reboot();
     }
 
@@ -249,16 +269,11 @@ void loop() {
     }
     neopixelWrite(RGB_BUILTIN, 0, 0, 0);
 
-    // save the last successful connection
-    time_t rawtime; 
-    time(&rawtime);
-    double difft = difftime((time_t)rawtime, last_connection);
-    if ((last_connection > 0) && (difft > 60000*10)) {
-        sendMessage("Disconnected from telegram for "+String(difft/60000)+" minutes");
-    } else {
-        log("Disconnected from telegram for "+String(difft)+" seconds");
+    // send failed connection attempt count
+    if (failed_connection_attempts > 0) {
+        failed_connection_attempts = 0;
+        sendMessage("Established connection to telegram after "+String(failed_connection_attempts)+" failed attempts");
     }
-    last_connection = rawtime;
 
     // check chip temperature
     float result = 0;
@@ -339,7 +354,7 @@ void loop() {
         (((min_hour < 0) && (max_hour < 0)) || ((timeinfo.tm_hour >= min_hour) && (timeinfo.tm_hour <= max_hour)))
         ) {
         start = millis();
-        //log("detecting motion...");
+        log("detecting motion...");
         detectMotion(); //initialize prev img
         bool confident_detection = true;
         for(int i = 0; i < 1; i++) {
@@ -350,8 +365,8 @@ void loop() {
             // in order to have a more optimized overall detection
             if (audio_detection) {
                 // Listen to detect sounds
-                audio_detected = audioDetection(audio_anomalies);
-                if (audio_detected > 0) {
+                audio_detected = audioDetection();
+                if ((audio_detected.freq > 0) || (audio_detected.amp > 0)) {
                     sendAlarm(ALARM_TYPE::AUDIO);
                 }
             } else {
@@ -365,6 +380,12 @@ void loop() {
         }
         end = millis();
         Serial.printf("Detection performed in %lu ms\n", (end-start));
+    } else if (audio_detection) {
+        // Listen to detect sounds
+        audio_detected = audioDetection();
+        if ((audio_detected.freq > 0) || (audio_detected.amp > 0)) {
+            sendAlarm(ALARM_TYPE::AUDIO);
+        } 
     } else {
         delay(1000);
     }
@@ -407,23 +428,24 @@ void sendAudio(int seconds) {
 }
 
 // ------ AUDIO DETECTION ------------
-int audioDetection(int threshold) {
-    // Listen the mic looking for loud sounds greater than threshold
+AudioData audioDetection() {
+    // Listen the mic looking for loud sounds greater than thresholds
+    AudioData res;
+    res.amp = 0;
+    res.freq = 0;
     size_t numBytesRead;
     size_t buf_len = 32000; // number of audio samples to capture from mic
     uint8_t *buffer = (uint8_t*)malloc(buf_len);
     if (!buffer) {
         log("Error: cannot allocate memory");
-        return 0;
+        return res;
     }
-    int res = 0;
     // Read data from DMA buffers into our copy buffer
     i2s_read(I2S_NUM_0, (void*)buffer, buf_len, &numBytesRead, portMAX_DELAY);
     const int16_t *samples = (const int16_t *)buffer;
     int num_samples = buf_len / sizeof(int16_t);
     int16_t maxsample = INT16_MIN, minsample = INT16_MAX, abssample;
-    int anomalies = 0;
-    int avg = 0;
+    int avg_amp = 0;
     int16_t avg_freq, freq_count, freq = 0;
     for (int i = 0; i < num_samples; i++) {
         minsample = min(minsample, samples[i]);
@@ -431,11 +453,8 @@ int audioDetection(int threshold) {
         //abssample = abs(samples[i]);
         // Consider only positive samples (they are half of num_samples)
         if (samples[i] > 0) {
-            avg += samples[i];
+            avg_amp += samples[i];
             freq++;
-            if (samples[i] > DEFAULT_AUDIO_THRESHOLD) {
-                anomalies++;
-            }
         } else {
             if (freq > 0) { // passing from positive values to negative
                 avg_freq += freq;
@@ -445,17 +464,17 @@ int audioDetection(int threshold) {
         }
     }
     avg_freq /= freq_count;
-    avg /= (num_samples/2);
-    int16_t amp = maxsample - abs(minsample); //min sample is likely negative
+    avg_amp /= (num_samples/2);
     //Serial.printf("Audio debug: %d samples, %d min, %d max, %d amp, %d avg\n", num_samples, minsample, maxsample, amp, avg);
-    if (debug) log("Audio anomalies: "+String(anomalies)+", Avg Frequency:"+String(avg_freq));
-    if ((avg_freq < 8) || // if we have a signal with high frequency probably it's an acoustic alarm, we must detect it
-        (anomalies > threshold)) { // otherwise filter the anomaly amplitudes using a threshold
+    if (debug) log("Avg Amplitude: "+String(avg_amp)+", Avg Frequency:"+String(avg_freq));
+    if ((avg_freq < audio_freq) || // if we have a signal with high frequency probably it's an acoustic alarm, we must detect it
+        (avg_amp > audio_amp)) { // otherwise filter the anomaly amplitudes using a threshold
         // Sound detected!
-        res = anomalies;
+        res.amp = avg_amp;
+        res.freq = avg_freq;
     }
 
-    if ((res > 0) && (freespaceAvailable())) {
+    if ((res.freq+res.amp > 0) && (freespaceAvailable())) {
         String filename = "/detection.wav";
         if (mem.exists(filename)) {
             mem.remove(filename);
@@ -520,7 +539,7 @@ bool isNight() {
     #ifdef DEBUG
     Serial.println("Night mode checking, avg brightness: "+String(pix_avg));
     #endif
-    return (pix_avg < 25);
+    return (pix_avg < brightness_threshold);
 }
 
 bool detectMotion() {
@@ -738,15 +757,28 @@ void handleCommands() {
                 }
                 sendAudio(num);
             } else if (msg.text.startsWith("/setaudio")) {
-                int num = MAX_AUDIO_ANOMALIES;
+                int separator = msg.text.indexOf(" ");
+                if (separator > 0) {
+                    String interval = msg.text.substring(separator+1);
+                    separator = interval.indexOf("-");
+                    if (separator > 0) {
+                        audio_amp = interval.substring(0,separator).toInt();
+                        audio_freq = interval.substring(separator+1).toInt();
+                        sendMessage("Configured audio amp to "+String(audio_amp)+" and audio freq to "+String(audio_freq));
+                    }
+                } else {
+                    audio_amp = DEFAULT_AMP_THRESHOLD;
+                    audio_freq = DEFAULT_FREQ_THRESHOLD;
+                }
+            } else if (msg.text.startsWith("/setnight")) {
+                int num = 0;
                 int separator = msg.text.indexOf(" ");
                 if (separator > 0) {
                     num = msg.text.substring(separator+1).toInt();
-                    sendMessage("Setting audio threshold to "+String(num));
-                    audio_anomalies = num;
-                } else {
-                    sendMessage("Setting audio threshold to default value");
-                    audio_anomalies = num;
+                }
+                if (num > 0) {
+                    log("Setting brightness threshold to "+String(num));
+                    brightness_threshold = num;
                 }
             } else if (msg.text.equalsIgnoreCase("/flash")) {
                 log("Sending Photo from CAM with flash");
@@ -812,6 +844,7 @@ void handleCommands() {
                 sendMessage("Setting audio detection to "+String(audio_detection));
             } else if (msg.text.equalsIgnoreCase("/stop")) {
                 enable_detection = false;
+                audio_detection = false;
                 night_mode = false;
                 saveSettings();
                 sendMessage("intrusion detection stopped");
@@ -863,7 +896,7 @@ void sendAlarm(ALARM_TYPE at) {
             // try to upload the picture
             tgbot.sendPhoto(userid, photoname.c_str(), mem, "");
         } else if (at == ALARM_TYPE::AUDIO) {
-            String m = "Audio Detected! Anomalies: "+String(audio_detected);
+            String m = "Audio Detected! Value: amp "+String(audio_detected.amp)+" freq "+String(audio_detected.freq);
             sendMessage(m);
             File fwr = mem.open("/detection.wav", FILE_READ);
             log("Sending audio detection of size "+String(fwr.size())+" to telegram");
@@ -894,10 +927,12 @@ void saveSettings() {
         settings.save("photoflash", photoflash);
         settings.save("debug", debug);
         settings.save("audio_detection", audio_detection);
-        settings.save("last_connection", last_connection);
-        settings.save("audio_anomalies", audio_anomalies);
+        settings.save("failed_connection_attempts", failed_connection_attempts);
+        settings.save("audio_amp", audio_amp);
+        settings.save("audio_freq", audio_freq);
         settings.save("min_hour", min_hour);
         settings.save("max_hour", max_hour);
+        settings.save("brightness_threshold", brightness_threshold);
         settings.close();
     }
 }
